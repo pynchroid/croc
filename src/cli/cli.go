@@ -141,6 +141,8 @@ func Run() (err error) {
 		&cli.IntFlag{Name: "retry", Value: 5, Usage: "number of times to retry on connection failure (0 = no retry)"},
 		&cli.IntFlag{Name: "retry-wait", Value: 5, Usage: "base wait in seconds between retries (exponential backoff)"},
 		&cli.IntFlag{Name: "timeout", Value: 30, Usage: "inactivity timeout in minutes (0 = 30 min default)"},
+		&cli.StringFlag{Name: "cipher", Value: "xchacha20", Usage: "encryption cipher (xchacha20, aes-gcm)"},
+		&cli.StringFlag{Name: "kdf", Value: "argon2id", Usage: "key derivation function (argon2id, pbkdf2)"},
 	}
 	app.EnableBashCompletion = true
 	app.HideHelp = false
@@ -343,6 +345,8 @@ func send(c *cli.Context) (err error) {
 		MaxRetries:        c.Int("retry"),
 		RetryWait:         time.Duration(c.Int("retry-wait")) * time.Second,
 		IdleTimeout:       time.Duration(c.Int("timeout")) * time.Minute,
+		Cipher:            c.String("cipher"),
+		KDF:               c.String("kdf"),
 	}
 	if crocOptions.RelayAddress != models.DEFAULT_RELAY {
 		crocOptions.RelayAddress6 = ""
@@ -639,6 +643,8 @@ func receive(c *cli.Context) (err error) {
 		MaxRetries:        c.Int("retry"),
 		RetryWait:         time.Duration(c.Int("retry-wait")) * time.Second,
 		IdleTimeout:       time.Duration(c.Int("timeout")) * time.Minute,
+		Cipher:            c.String("cipher"),
+		KDF:               c.String("kdf"),
 	}
 	if crocOptions.RelayAddress != models.DEFAULT_RELAY {
 		crocOptions.RelayAddress6 = ""

@@ -94,9 +94,13 @@ type Options struct {
 	ExtendedClipboard bool
 
 	// Retry settings for resilient transfers
-	MaxRetries int           // maximum number of retry attempts (0 = no retry)
-	RetryWait  time.Duration // base wait between retries (exponential backoff)
+	MaxRetries  int           // maximum number of retry attempts (0 = no retry)
+	RetryWait   time.Duration // base wait between retries (exponential backoff)
 	IdleTimeout time.Duration // inactivity timeout for connections (0 = default 30m)
+
+	// Crypto settings
+	Cipher string // "xchacha20" (default) or "aes-gcm" (legacy)
+	KDF    string // "argon2id" (default) or "pbkdf2" (legacy)
 }
 
 type SimpleMessage struct {
@@ -991,6 +995,73 @@ func (c *Client) ReceiveWithRetry() (err error) {
 	return fmt.Errorf("transfer failed after %d retries: %w", maxRetries, err)
 }
 
+const progressManifestFile = ".croc-progress"
+
+// progressEntry represents a completed file in the progress manifest.
+type progressEntry struct {
+	Name string `json:"name"`
+	Hash string `json:"hash"`
+	Size int64  `json:"size"`
+}
+
+// saveFileProgress appends a completed file to the on-disk progress manifest.
+func (c *Client) saveFileProgress(fileIdx int) {
+	if c.Options.IsSender || fileIdx >= len(c.FilesToTransfer) {
+		return
+	}
+	fi := c.FilesToTransfer[fileIdx]
+
+	var entries []progressEntry
+	if data, err := os.ReadFile(progressManifestFile); err == nil {
+		json.Unmarshal(data, &entries)
+	}
+	entries = append(entries, progressEntry{
+		Name: path.Join(fi.FolderRemote, fi.Name),
+		Hash: hex.EncodeToString(fi.Hash),
+		Size: fi.Size,
+	})
+	data, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		log.Debugf("progress manifest marshal error: %v", err)
+		return
+	}
+	if err := os.WriteFile(progressManifestFile, data, 0o644); err != nil {
+		log.Debugf("progress manifest write error: %v", err)
+	}
+}
+
+// loadFileProgress loads the progress manifest and marks matching files as finished.
+func (c *Client) loadFileProgress() {
+	if c.Options.IsSender {
+		return
+	}
+	data, err := os.ReadFile(progressManifestFile)
+	if err != nil {
+		return
+	}
+	var entries []progressEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		log.Debugf("progress manifest parse error: %v", err)
+		return
+	}
+	completed := make(map[string]progressEntry, len(entries))
+	for _, e := range entries {
+		completed[e.Name] = e
+	}
+	for i, fi := range c.FilesToTransfer {
+		key := path.Join(fi.FolderRemote, fi.Name)
+		if entry, ok := completed[key]; ok && entry.Hash == hex.EncodeToString(fi.Hash) && entry.Size == fi.Size {
+			c.FilesHasFinished[i] = struct{}{}
+			log.Debugf("skipping already-completed file: %s", key)
+		}
+	}
+}
+
+// cleanupProgressManifest removes the progress manifest after a successful transfer.
+func cleanupProgressManifest() {
+	os.Remove(progressManifestFile)
+}
+
 // resetForRetry clears transient state so a fresh transfer attempt can proceed.
 // File-level progress is preserved on disk for chunk-based resume.
 func (c *Client) resetForRetry() {
@@ -1041,6 +1112,30 @@ func (c *Client) checkKeyRotation() {
 		c.encryptCounter = 0
 		log.Debugf("key rotated (generation %d)", c.keyRotationCount)
 	}
+}
+
+// deriveKey derives a key from passphrase and salt using the configured KDF.
+func (c *Client) deriveKey(passphrase, salt []byte) (key []byte, outSalt []byte, err error) {
+	if c.Options.KDF == "pbkdf2" {
+		return crypt.NewLegacy(passphrase, salt)
+	}
+	return crypt.New(passphrase, salt)
+}
+
+// encryptBytes encrypts data using the configured cipher.
+func (c *Client) encryptBytes(plaintext, key []byte) ([]byte, error) {
+	if c.Options.Cipher == "aes-gcm" {
+		return crypt.EncryptAES(plaintext, key)
+	}
+	return crypt.Encrypt(plaintext, key)
+}
+
+// decryptBytes decrypts data using the configured cipher.
+func (c *Client) decryptBytes(encrypted, key []byte) ([]byte, error) {
+	if c.Options.Cipher == "aes-gcm" {
+		return crypt.DecryptAES(encrypted, key)
+	}
+	return crypt.Decrypt(encrypted, key)
 }
 
 func showReceiveCommandQrCode(command string) {
@@ -1311,6 +1406,7 @@ func (c *Client) Receive() (err error) {
 	fmt.Fprintf(os.Stderr, "\rsecuring channel...")
 	err = c.transfer()
 	if err == nil {
+		cleanupProgressManifest()
 		if c.numberOfTransferredFiles+len(c.EmptyFoldersToTransfer) == 0 {
 			fmt.Fprintf(os.Stderr, "\rNo files transferred.\n")
 		}
@@ -1659,7 +1755,7 @@ func (c *Client) processMessagePake(m message.Message) (err error) {
 	if err != nil {
 		return err
 	}
-	c.Key, _, err = crypt.New(key, salt)
+	c.Key, _, err = c.deriveKey(key, salt)
 	if err != nil {
 		return err
 	}
@@ -1933,6 +2029,7 @@ func (c *Client) recipientGetFileReady(finished bool) (err error) {
 		}
 		c.SuccessfulTransfer = true
 		c.FilesHasFinished[c.FilesToTransferCurrentNum] = struct{}{}
+		c.saveFileProgress(c.FilesToTransferCurrentNum)
 		return
 	}
 
@@ -2061,6 +2158,8 @@ func (c *Client) updateIfRecipientHasFileInfo() (err error) {
 	if c.Options.IsSender || !c.Step2FileInfoTransferred || c.Step3RecipientRequestFile {
 		return
 	}
+	// load progress manifest to skip already-completed files from previous runs
+	c.loadFileProgress()
 	// find the next file to transfer and send that number
 	// if the files are the same size, then look for missing chunks
 	finished := true
@@ -2266,7 +2365,7 @@ func (c *Client) receiveData(i int) {
 		}
 
 		c.checkKeyRotation()
-		data, err = crypt.Decrypt(data, c.Key)
+		data, err = c.decryptBytes(data, c.Key)
 		if err != nil {
 			log.Errorf("receiveData(%d): decrypt error: %v", i, err)
 			c.stop.Cancel()
@@ -2401,13 +2500,13 @@ func (c *Client) sendData(i int) {
 					binary.LittleEndian.PutUint64(posByte, pos)
 					var err error
 					var dataToSend []byte
-					if c.Options.NoCompress {
-						dataToSend, err = crypt.Encrypt(
+						if c.Options.NoCompress {
+						dataToSend, err = c.encryptBytes(
 							append(posByte, data[:n]...),
 							c.Key,
 						)
 					} else {
-						dataToSend, err = crypt.Encrypt(
+						dataToSend, err = c.encryptBytes(
 							compress.Compress(
 								append(posByte, data[:n]...),
 							),
