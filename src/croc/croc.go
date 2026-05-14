@@ -94,9 +94,13 @@ type Options struct {
 	ExtendedClipboard bool
 
 	// Retry settings for resilient transfers
-	MaxRetries int           // maximum number of retry attempts (0 = no retry)
-	RetryWait  time.Duration // base wait between retries (exponential backoff)
+	MaxRetries  int           // maximum number of retry attempts (0 = no retry)
+	RetryWait   time.Duration // base wait between retries (exponential backoff)
 	IdleTimeout time.Duration // inactivity timeout for connections (0 = default 30m)
+
+	// Crypto settings
+	Cipher string // "xchacha20" (default) or "aes-gcm" (legacy)
+	KDF    string // "argon2id" (default) or "pbkdf2" (legacy)
 }
 
 type SimpleMessage struct {
@@ -1043,6 +1047,30 @@ func (c *Client) checkKeyRotation() {
 	}
 }
 
+// deriveKey derives a key from passphrase and salt using the configured KDF.
+func (c *Client) deriveKey(passphrase, salt []byte) (key []byte, outSalt []byte, err error) {
+	if c.Options.KDF == "pbkdf2" {
+		return crypt.NewLegacy(passphrase, salt)
+	}
+	return crypt.New(passphrase, salt)
+}
+
+// encryptBytes encrypts data using the configured cipher.
+func (c *Client) encryptBytes(plaintext, key []byte) ([]byte, error) {
+	if c.Options.Cipher == "aes-gcm" {
+		return crypt.EncryptAES(plaintext, key)
+	}
+	return crypt.Encrypt(plaintext, key)
+}
+
+// decryptBytes decrypts data using the configured cipher.
+func (c *Client) decryptBytes(encrypted, key []byte) ([]byte, error) {
+	if c.Options.Cipher == "aes-gcm" {
+		return crypt.DecryptAES(encrypted, key)
+	}
+	return crypt.Decrypt(encrypted, key)
+}
+
 func showReceiveCommandQrCode(command string) {
 	qrCode, err := qrcode.New(command, qrcode.Medium)
 	if err == nil {
@@ -1659,7 +1687,7 @@ func (c *Client) processMessagePake(m message.Message) (err error) {
 	if err != nil {
 		return err
 	}
-	c.Key, _, err = crypt.New(key, salt)
+	c.Key, _, err = c.deriveKey(key, salt)
 	if err != nil {
 		return err
 	}
@@ -2266,7 +2294,7 @@ func (c *Client) receiveData(i int) {
 		}
 
 		c.checkKeyRotation()
-		data, err = crypt.Decrypt(data, c.Key)
+		data, err = c.decryptBytes(data, c.Key)
 		if err != nil {
 			log.Errorf("receiveData(%d): decrypt error: %v", i, err)
 			c.stop.Cancel()
@@ -2401,13 +2429,13 @@ func (c *Client) sendData(i int) {
 					binary.LittleEndian.PutUint64(posByte, pos)
 					var err error
 					var dataToSend []byte
-					if c.Options.NoCompress {
-						dataToSend, err = crypt.Encrypt(
+						if c.Options.NoCompress {
+						dataToSend, err = c.encryptBytes(
 							append(posByte, data[:n]...),
 							c.Key,
 						)
 					} else {
-						dataToSend, err = crypt.Encrypt(
+						dataToSend, err = c.encryptBytes(
 							compress.Compress(
 								append(posByte, data[:n]...),
 							),
