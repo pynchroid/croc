@@ -995,6 +995,73 @@ func (c *Client) ReceiveWithRetry() (err error) {
 	return fmt.Errorf("transfer failed after %d retries: %w", maxRetries, err)
 }
 
+const progressManifestFile = ".croc-progress"
+
+// progressEntry represents a completed file in the progress manifest.
+type progressEntry struct {
+	Name string `json:"name"`
+	Hash string `json:"hash"`
+	Size int64  `json:"size"`
+}
+
+// saveFileProgress appends a completed file to the on-disk progress manifest.
+func (c *Client) saveFileProgress(fileIdx int) {
+	if c.Options.IsSender || fileIdx >= len(c.FilesToTransfer) {
+		return
+	}
+	fi := c.FilesToTransfer[fileIdx]
+
+	var entries []progressEntry
+	if data, err := os.ReadFile(progressManifestFile); err == nil {
+		json.Unmarshal(data, &entries)
+	}
+	entries = append(entries, progressEntry{
+		Name: path.Join(fi.FolderRemote, fi.Name),
+		Hash: hex.EncodeToString(fi.Hash),
+		Size: fi.Size,
+	})
+	data, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		log.Debugf("progress manifest marshal error: %v", err)
+		return
+	}
+	if err := os.WriteFile(progressManifestFile, data, 0o644); err != nil {
+		log.Debugf("progress manifest write error: %v", err)
+	}
+}
+
+// loadFileProgress loads the progress manifest and marks matching files as finished.
+func (c *Client) loadFileProgress() {
+	if c.Options.IsSender {
+		return
+	}
+	data, err := os.ReadFile(progressManifestFile)
+	if err != nil {
+		return
+	}
+	var entries []progressEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		log.Debugf("progress manifest parse error: %v", err)
+		return
+	}
+	completed := make(map[string]progressEntry, len(entries))
+	for _, e := range entries {
+		completed[e.Name] = e
+	}
+	for i, fi := range c.FilesToTransfer {
+		key := path.Join(fi.FolderRemote, fi.Name)
+		if entry, ok := completed[key]; ok && entry.Hash == hex.EncodeToString(fi.Hash) && entry.Size == fi.Size {
+			c.FilesHasFinished[i] = struct{}{}
+			log.Debugf("skipping already-completed file: %s", key)
+		}
+	}
+}
+
+// cleanupProgressManifest removes the progress manifest after a successful transfer.
+func cleanupProgressManifest() {
+	os.Remove(progressManifestFile)
+}
+
 // resetForRetry clears transient state so a fresh transfer attempt can proceed.
 // File-level progress is preserved on disk for chunk-based resume.
 func (c *Client) resetForRetry() {
@@ -1339,6 +1406,7 @@ func (c *Client) Receive() (err error) {
 	fmt.Fprintf(os.Stderr, "\rsecuring channel...")
 	err = c.transfer()
 	if err == nil {
+		cleanupProgressManifest()
 		if c.numberOfTransferredFiles+len(c.EmptyFoldersToTransfer) == 0 {
 			fmt.Fprintf(os.Stderr, "\rNo files transferred.\n")
 		}
@@ -1961,6 +2029,7 @@ func (c *Client) recipientGetFileReady(finished bool) (err error) {
 		}
 		c.SuccessfulTransfer = true
 		c.FilesHasFinished[c.FilesToTransferCurrentNum] = struct{}{}
+		c.saveFileProgress(c.FilesToTransferCurrentNum)
 		return
 	}
 
@@ -2089,6 +2158,8 @@ func (c *Client) updateIfRecipientHasFileInfo() (err error) {
 	if c.Options.IsSender || !c.Step2FileInfoTransferred || c.Step3RecipientRequestFile {
 		return
 	}
+	// load progress manifest to skip already-completed files from previous runs
+	c.loadFileProgress()
 	// find the next file to transfer and send that number
 	// if the files are the same size, then look for missing chunks
 	finished := true

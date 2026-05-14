@@ -18,11 +18,11 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: '^1.24.0'
+          go-version: '^1.25.0'
 
       - name: Prepare source tarball
         run: |
-          git clone -b ${{ github.event.release.name }} --depth 1 https://github.com/schollz/croc croc-${{ github.event.release.name }}
+          git clone -b ${{ github.event.release.name }} --depth 1 https://github.com/${{ github.repository }} croc-${{ github.event.release.name }}
           cd croc-${{ github.event.release.name }} && go mod tidy && go mod vendor
           cd .. && tar -czvf croc_${{ github.event.release.name }}_src.tar.gz croc-${{ github.event.release.name }}
 
@@ -153,7 +153,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: '^1.24.0'
+          go-version: '^1.25.0'
 
       - name: Build binary
         env:
