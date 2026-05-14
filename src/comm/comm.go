@@ -23,6 +23,10 @@ var MAGIC_BYTES = []byte("croc")
 
 const maxReadMessageSize = 64 * 1024 * 1024
 
+// IdleTimeout controls how long a connection can be idle before timing out.
+// Activity resets the deadline, so active transfers can run indefinitely.
+var IdleTimeout = 30 * time.Minute
+
 // Comm is some basic TCP communication
 type Comm struct {
 	connection net.Conn
@@ -90,20 +94,30 @@ func NewConnection(address string, timelimit ...time.Duration) (c *Comm, err err
 	return
 }
 
-// New returns a new comm
+// New returns a new comm with activity-based deadlines and TCP keepalive.
+// Deadlines are refreshed on every read/write so active transfers run indefinitely.
 func New(c net.Conn) *Comm {
-	if err := c.SetReadDeadline(time.Now().Add(3 * time.Hour)); err != nil {
-		log.Warnf("error setting read deadline: %v", err)
-	}
-	if err := c.SetDeadline(time.Now().Add(3 * time.Hour)); err != nil {
-		log.Warnf("error setting overall deadline: %v", err)
-	}
-	if err := c.SetWriteDeadline(time.Now().Add(3 * time.Hour)); err != nil {
-		log.Errorf("error setting write deadline: %v", err)
+	// Enable TCP keepalive to detect dead connections and prevent NAT/firewall timeouts
+	if tc, ok := c.(*net.TCPConn); ok {
+		if err := tc.SetKeepAlive(true); err != nil {
+			log.Warnf("error enabling TCP keepalive: %v", err)
+		}
+		if err := tc.SetKeepAlivePeriod(30 * time.Second); err != nil {
+			log.Warnf("error setting TCP keepalive period: %v", err)
+		}
 	}
 	comm := new(Comm)
 	comm.connection = c
+	comm.refreshDeadline()
 	return comm
+}
+
+// refreshDeadline resets all deadlines based on the current IdleTimeout.
+func (c *Comm) refreshDeadline() {
+	deadline := time.Now().Add(IdleTimeout)
+	if err := c.connection.SetDeadline(deadline); err != nil {
+		log.Warnf("error refreshing deadline: %v", err)
+	}
 }
 
 // Connection returns the net.Conn connection
@@ -135,18 +149,14 @@ func (c *Comm) Write(b []byte) (n int, err error) {
 		err = fmt.Errorf("wanted to write %d but wrote %d", len(b), n)
 		return
 	}
+	// refresh deadline on successful write
+	c.refreshDeadline()
 	return
 }
 
 func (c *Comm) Read() (buf []byte, numBytes int, bs []byte, err error) {
-	// long read deadline in case waiting for file
-	if err = c.connection.SetReadDeadline(time.Now().Add(3 * time.Hour)); err != nil {
-		log.Warnf("error setting read deadline: %v", err)
-	}
-	// must clear the timeout setting
-	if err := c.connection.SetDeadline(time.Time{}); err != nil {
-		log.Warnf("failed to clear deadline: %v", err)
-	}
+	// refresh deadline for the initial read (waiting for next message)
+	c.refreshDeadline()
 
 	// read until we get 4 bytes for the magic
 	header := make([]byte, 4)
@@ -183,8 +193,8 @@ func (c *Comm) Read() (buf []byte, numBytes int, bs []byte, err error) {
 	}
 	numBytes = int(numBytesUint32)
 
-	// shorten the reading deadline in case getting weird data
-	if err = c.connection.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+	// shorter deadline for the payload read (data should arrive promptly after header)
+	if err = c.connection.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
 		log.Warnf("error setting read deadline: %v", err)
 	}
 	buf = make([]byte, numBytes)
@@ -193,6 +203,8 @@ func (c *Comm) Read() (buf []byte, numBytes int, bs []byte, err error) {
 		log.Debugf("consecutive read error: %v", err)
 		return
 	}
+	// refresh deadline on successful read
+	c.refreshDeadline()
 	return
 }
 

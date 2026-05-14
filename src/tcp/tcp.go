@@ -458,7 +458,8 @@ func (s *server) deleteRoom(room string) {
 //	Read()s from the socket to the channel.
 func chanFromConn(conn net.Conn) chan []byte {
 	c := make(chan []byte, 1)
-	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Hour)); err != nil {
+	// Use activity-based deadline from comm.IdleTimeout instead of fixed 3h
+	if err := conn.SetReadDeadline(time.Now().Add(comm.IdleTimeout)); err != nil {
 		log.Warnf("can't set read deadline: %v", err)
 	}
 
@@ -467,8 +468,11 @@ func chanFromConn(conn net.Conn) chan []byte {
 		for {
 			n, err := conn.Read(b)
 			if n > 0 {
+				// refresh deadline on activity
+				if deadlineErr := conn.SetReadDeadline(time.Now().Add(comm.IdleTimeout)); deadlineErr != nil {
+					log.Warnf("can't refresh read deadline: %v", deadlineErr)
+				}
 				res := make([]byte, n)
-				// Copy the buffer so it doesn't get changed while read by the recipient.
 				copy(res, b[:n])
 				c <- res
 			}

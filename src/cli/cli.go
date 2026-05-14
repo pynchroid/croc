@@ -138,6 +138,9 @@ func Run() (err error) {
 		&cli.StringFlag{Name: "socks5", Value: "", Usage: "add a socks5 proxy", EnvVars: []string{"SOCKS5_PROXY"}},
 		&cli.StringFlag{Name: "connect", Value: "", Usage: "add a http proxy", EnvVars: []string{"HTTP_PROXY"}},
 		&cli.StringFlag{Name: "throttleUpload", Value: "", Usage: "throttle the upload speed e.g. 500k"},
+		&cli.IntFlag{Name: "retry", Value: 5, Usage: "number of times to retry on connection failure (0 = no retry)"},
+		&cli.IntFlag{Name: "retry-wait", Value: 5, Usage: "base wait in seconds between retries (exponential backoff)"},
+		&cli.IntFlag{Name: "timeout", Value: 30, Usage: "inactivity timeout in minutes (0 = 30 min default)"},
 	}
 	app.EnableBashCompletion = true
 	app.HideHelp = false
@@ -337,6 +340,9 @@ func send(c *cli.Context) (err error) {
 		Quiet:             c.Bool("quiet"),
 		DisableClipboard:  c.Bool("disable-clipboard"),
 		ExtendedClipboard: c.Bool("extended-clipboard"),
+		MaxRetries:        c.Int("retry"),
+		RetryWait:         time.Duration(c.Int("retry-wait")) * time.Second,
+		IdleTimeout:       time.Duration(c.Int("timeout")) * time.Minute,
 	}
 	if crocOptions.RelayAddress != models.DEFAULT_RELAY {
 		crocOptions.RelayAddress6 = ""
@@ -505,7 +511,7 @@ Or you can go back to the classic croc behavior by enabling classic mode:
 
 	// save the config
 	saveConfig(c, crocOptions)
-	err = cr.Send(minimalFileInfos, emptyFoldersToTransfer, totalNumberFolders)
+	err = cr.SendWithRetry(minimalFileInfos, emptyFoldersToTransfer, totalNumberFolders)
 	return
 }
 
@@ -630,6 +636,9 @@ func receive(c *cli.Context) (err error) {
 		Quiet:             c.Bool("quiet"),
 		DisableClipboard:  c.Bool("disable-clipboard"),
 		ExtendedClipboard: c.Bool("extended-clipboard"),
+		MaxRetries:        c.Int("retry"),
+		RetryWait:         time.Duration(c.Int("retry-wait")) * time.Second,
+		IdleTimeout:       time.Duration(c.Int("timeout")) * time.Minute,
 	}
 	if crocOptions.RelayAddress != models.DEFAULT_RELAY {
 		crocOptions.RelayAddress6 = ""
@@ -772,7 +781,7 @@ Or you can go back to the classic croc behavior by enabling classic mode:
 		log.Debugf("wrote %s", configFile)
 	}
 
-	err = cr.Receive()
+	err = cr.ReceiveWithRetry()
 	return
 }
 

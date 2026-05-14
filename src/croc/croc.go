@@ -92,6 +92,11 @@ type Options struct {
 	Quiet             bool
 	DisableClipboard  bool
 	ExtendedClipboard bool
+
+	// Retry settings for resilient transfers
+	MaxRetries int           // maximum number of retry attempts (0 = no retry)
+	RetryWait  time.Duration // base wait between retries (exponential backoff)
+	IdleTimeout time.Duration // inactivity timeout for connections (0 = default 30m)
 }
 
 type SimpleMessage struct {
@@ -134,6 +139,12 @@ type Client struct {
 	TotalChunksTransferred int
 	chunkMap               map[uint64]struct{}
 	limiter                *rate.Limiter
+
+	// key rotation state
+	baseKey          []byte
+	keyRotationCount uint64
+	encryptCounter   uint64
+	encryptMu        sync.Mutex
 
 	// tcp connections
 	conn []*comm.Comm
@@ -261,6 +272,11 @@ func New(ops Options) (c *Client, err error) {
 	}
 	if err != nil {
 		return
+	}
+
+	// apply idle timeout if set
+	if c.Options.IdleTimeout > 0 {
+		comm.IdleTimeout = c.Options.IdleTimeout
 	}
 
 	c.mutex = &sync.Mutex{}
@@ -882,6 +898,151 @@ On the other computer run:
 	return err
 }
 
+// isRetryableError returns true if the error is transient and worth retrying
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	// non-retryable: user refused, password wrong, security failures
+	nonRetryable := []string{
+		"refusing files",
+		"refused files",
+		"bad password",
+		"password mismatch",
+		"could not secure channel",
+		"message authentication failed",
+		"pake not successful",
+	}
+	for _, nr := range nonRetryable {
+		if strings.Contains(s, nr) {
+			return false
+		}
+	}
+	return true
+}
+
+// SendWithRetry wraps Send with automatic retry on transient failures
+func (c *Client) SendWithRetry(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, totalNumberFolders int) (err error) {
+	maxRetries := c.Options.MaxRetries
+	if maxRetries <= 0 {
+		return c.Send(filesInfo, emptyFoldersToTransfer, totalNumberFolders)
+	}
+
+	baseWait := c.Options.RetryWait
+	if baseWait <= 0 {
+		baseWait = 5 * time.Second
+	}
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			wait := time.Duration(float64(baseWait) * math.Pow(2, float64(attempt-1)))
+			if wait > 5*time.Minute {
+				wait = 5 * time.Minute
+			}
+			fmt.Fprintf(os.Stderr, "\nTransfer failed: %v\nRetrying in %v (attempt %d/%d)...\n", err, wait, attempt, maxRetries)
+			time.Sleep(wait)
+			// reset transfer state for retry
+			c.resetForRetry()
+		}
+		err = c.Send(filesInfo, emptyFoldersToTransfer, totalNumberFolders)
+		if err == nil {
+			return nil
+		}
+		if !isRetryableError(err) {
+			return err
+		}
+		log.Debugf("retryable error on attempt %d: %v", attempt, err)
+	}
+	return fmt.Errorf("transfer failed after %d retries: %w", maxRetries, err)
+}
+
+// ReceiveWithRetry wraps Receive with automatic retry on transient failures
+func (c *Client) ReceiveWithRetry() (err error) {
+	maxRetries := c.Options.MaxRetries
+	if maxRetries <= 0 {
+		return c.Receive()
+	}
+
+	baseWait := c.Options.RetryWait
+	if baseWait <= 0 {
+		baseWait = 5 * time.Second
+	}
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			wait := time.Duration(float64(baseWait) * math.Pow(2, float64(attempt-1)))
+			if wait > 5*time.Minute {
+				wait = 5 * time.Minute
+			}
+			fmt.Fprintf(os.Stderr, "\nTransfer failed: %v\nRetrying in %v (attempt %d/%d)...\n", err, wait, attempt, maxRetries)
+			time.Sleep(wait)
+			c.resetForRetry()
+		}
+		err = c.Receive()
+		if err == nil {
+			return nil
+		}
+		if !isRetryableError(err) {
+			return err
+		}
+		log.Debugf("retryable error on attempt %d: %v", attempt, err)
+	}
+	return fmt.Errorf("transfer failed after %d retries: %w", maxRetries, err)
+}
+
+// resetForRetry clears transient state so a fresh transfer attempt can proceed.
+// File-level progress is preserved on disk for chunk-based resume.
+func (c *Client) resetForRetry() {
+	c.Step1ChannelSecured = false
+	c.Step2FileInfoTransferred = false
+	c.Step3RecipientRequestFile = false
+	c.Step4FileTransferred = false
+	c.Step5CloseChannels = false
+	c.SuccessfulTransfer = false
+	c.TotalSent = 0
+	c.TotalChunksTransferred = 0
+	c.chunkMap = nil
+	c.firstSend = false
+	c.numfinished = 0
+	c.Key = nil
+
+	// close old connections
+	for i := range c.conn {
+		if c.conn[i] != nil {
+			c.conn[i].Close()
+			c.conn[i] = nil
+		}
+	}
+
+	// reinitialize PAKE for recipient
+	if !c.Options.IsSender {
+		c.Pake, _ = pake.InitCurve([]byte(c.Options.SharedSecret[5:]), 0, c.Options.Curve)
+	}
+
+	// reinitialize context
+	c.stop = newStop(context.Background())
+}
+
+// checkKeyRotation increments the encrypt counter and rotates the key if needed.
+// Must be called for every encrypt or decrypt operation on the data channel.
+func (c *Client) checkKeyRotation() {
+	c.encryptMu.Lock()
+	defer c.encryptMu.Unlock()
+	c.encryptCounter++
+	if c.encryptCounter >= crypt.KeyRotationInterval {
+		c.keyRotationCount++
+		newKey, err := crypt.DeriveRotatedKey(c.baseKey, c.keyRotationCount)
+		if err != nil {
+			log.Errorf("key rotation failed: %v", err)
+			return
+		}
+		c.Key = newKey
+		c.encryptCounter = 0
+		log.Debugf("key rotated (generation %d)", c.keyRotationCount)
+	}
+}
+
 func showReceiveCommandQrCode(command string) {
 	qrCode, err := qrcode.New(command, qrcode.Medium)
 	if err == nil {
@@ -1192,6 +1353,12 @@ func (c *Client) transfer() (err error) {
 			log.Debugf("got error receiving: %v", err)
 			if !c.Step1ChannelSecured {
 				err = fmt.Errorf("could not secure channel")
+			} else if strings.Contains(err.Error(), "i/o timeout") {
+				err = fmt.Errorf("connection timed out after %v of inactivity: %w", comm.IdleTimeout, err)
+			} else if strings.Contains(err.Error(), "connection reset") || strings.Contains(err.Error(), "broken pipe") {
+				err = fmt.Errorf("connection lost (network interruption): %w", err)
+			} else if strings.Contains(err.Error(), "EOF") {
+				err = fmt.Errorf("peer disconnected unexpectedly: %w", err)
 			}
 			break
 		}
@@ -1496,6 +1663,10 @@ func (c *Client) processMessagePake(m message.Message) (err error) {
 	if err != nil {
 		return err
 	}
+	c.baseKey = make([]byte, len(c.Key))
+	copy(c.baseKey, c.Key)
+	c.keyRotationCount = 0
+	c.encryptCounter = 0
 	log.Debugf("generated key = %+x with salt %x", c.Key, salt)
 
 	// connects to the other ports of the server for transfer
@@ -1523,7 +1694,8 @@ func (c *Client) processMessagePake(m message.Message) (err error) {
 				fmt.Sprintf("%s-%d", c.Options.RoomName, j),
 			)
 			if err != nil {
-				panic(err)
+				log.Errorf("failed to connect to transfer port %s: %v", server, err)
+				return
 			}
 			log.Debugf("connected to %s", server)
 			if !c.Options.IsSender {
@@ -1752,13 +1924,12 @@ func (c *Client) recipientInitializeFile() (err error) {
 
 func (c *Client) recipientGetFileReady(finished bool) (err error) {
 	if finished {
-		// TODO: do the last finishing stuff
 		log.Debug("finished")
 		err = message.Send(c.conn[0], c.Key, message.Message{
 			Type: message.TypeFinished,
 		})
 		if err != nil {
-			panic(err)
+			return
 		}
 		c.SuccessfulTransfer = true
 		c.FilesHasFinished[c.FilesToTransferCurrentNum] = struct{}{}
@@ -2082,20 +2253,11 @@ func (c *Client) setBar() {
 }
 
 func (c *Client) receiveData(i int) {
-	defer func() {
-		if r := recover(); r != nil {
-			if c.stop.gui {
-				log.Errorf("panic: %v", r)
-				c.stop.Cancel()
-			} else {
-				panic(r)
-			}
-		}
-	}()
 	log.Tracef("%d receiving data", i)
 	for {
 		data, err := c.conn[i+1].Receive()
 		if err != nil {
+			log.Debugf("receiveData(%d): connection error: %v", i, err)
 			break
 		}
 		if bytes.Equal(data, []byte{1}) {
@@ -2103,9 +2265,12 @@ func (c *Client) receiveData(i int) {
 			continue
 		}
 
+		c.checkKeyRotation()
 		data, err = crypt.Decrypt(data, c.Key)
 		if err != nil {
-			panic(err)
+			log.Errorf("receiveData(%d): decrypt error: %v", i, err)
+			c.stop.Cancel()
+			return
 		}
 		if !c.Options.NoCompress {
 			data = compress.Decompress(data)
@@ -2116,7 +2281,9 @@ func (c *Client) receiveData(i int) {
 		rbuf := bytes.NewReader(data[:8])
 		err = binary.Read(rbuf, binary.LittleEndian, &position)
 		if err != nil {
-			panic(err)
+			log.Errorf("receiveData(%d): binary read error: %v", i, err)
+			c.stop.Cancel()
+			return
 		}
 		positionInt64 := int64(position)
 
@@ -2145,12 +2312,14 @@ func (c *Client) receiveData(i int) {
 		}
 		_, err = c.CurrentFile.WriteAt(data[8:], positionInt64)
 		if err != nil {
-			panic(err)
+			c.mutex.Unlock()
+			log.Errorf("receiveData(%d): file write error: %v", i, err)
+			c.stop.Cancel()
+			return
 		}
 		c.bar.Add(len(data[8:]))
 		c.TotalSent += int64(len(data[8:]))
 		c.TotalChunksTransferred++
-		// log.Debug(len(c.CurrentFileChunks), c.TotalChunksTransferred, c.TotalSent, c.FilesToTransfer[c.FilesToTransferCurrentNum].Size)
 
 		if !c.CurrentFileIsClosed && (c.TotalChunksTransferred == len(c.CurrentFileChunks) || c.TotalSent == c.FilesToTransfer[c.FilesToTransferCurrentNum].Size) {
 			c.CurrentFileIsClosed = true
@@ -2173,7 +2342,10 @@ func (c *Client) receiveData(i int) {
 				Type: message.TypeCloseSender,
 			})
 			if err != nil {
-				panic(err)
+				log.Errorf("receiveData(%d): send close-sender error: %v", i, err)
+				c.mutex.Unlock()
+				c.stop.Cancel()
+				return
 			}
 		}
 		c.mutex.Unlock()
@@ -2182,14 +2354,6 @@ func (c *Client) receiveData(i int) {
 
 func (c *Client) sendData(i int) {
 	defer func() {
-		if r := recover(); r != nil {
-			if c.stop.gui {
-				log.Errorf("panic: %v", r)
-				c.stop.Cancel()
-			} else {
-				panic(r)
-			}
-		}
 		log.Debugf("finished with %d", i)
 		c.numfinished++
 		if c.numfinished == len(c.Options.RelayPorts) {
@@ -2232,7 +2396,7 @@ func (c *Client) sendData(i int) {
 				}
 				c.mutex.Unlock()
 				if usableChunk {
-					// log.Debugf("sending chunk %d", pos)
+					c.checkKeyRotation()
 					posByte := make([]byte, 8)
 					binary.LittleEndian.PutUint64(posByte, pos)
 					var err error
@@ -2251,16 +2415,19 @@ func (c *Client) sendData(i int) {
 						)
 					}
 					if err != nil {
-						panic(err)
+						log.Errorf("sendData(%d): encrypt error: %v", i, err)
+						c.stop.Cancel()
+						return
 					}
 
 					err = c.conn[i+1].Send(dataToSend)
 					if err != nil {
-						panic(err)
+						log.Errorf("sendData(%d): connection send error: %v", i, err)
+						c.stop.Cancel()
+						return
 					}
 					c.bar.Add(n)
 					c.TotalSent += int64(n)
-					// time.Sleep(100 * time.Millisecond)
 				}
 			}
 		}
@@ -2276,7 +2443,9 @@ func (c *Client) sendData(i int) {
 			if errRead == io.EOF {
 				break
 			}
-			panic(errRead)
+			log.Errorf("sendData(%d): file read error: %v", i, errRead)
+			c.stop.Cancel()
+			return
 		}
 	}
 }
