@@ -114,23 +114,25 @@ The code phrase is used to establish password-authenticated key agreement ([PAKE
 
 #### Retry and Long Transfers
 
-By default, croc retries up to 5 times on connection failure with exponential backoff. For large transfers (movie libraries, TV libraries), increase the timeout and retries:
+Retry and long-session support is built in — no flags needed. Just run `croc send` and it handles the rest:
+
+- **20 automatic retries** with exponential backoff (3s → 6s → 12s → ... → 5min cap)
+- **2-hour idle timeout** that resets on every successful read/write, so active transfers run indefinitely
+- **Per-file progress tracking** via `.croc-progress` manifest — interrupted multi-file transfers automatically skip already-completed files on retry
 
 ```bash
-# Send a large folder with generous timeout and retries
-croc --retry 10 --timeout 120 send my-movie-library/
-
-# Receive with matching settings
-croc --retry 10 --timeout 120 <code-phrase>
+# Just works — retry and timeout are built in
+croc send my-movie-library/
+croc <code-phrase>
 ```
+
+To customize the defaults:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--retry` | `5` | Number of retry attempts on connection failure (0 = no retry) |
-| `--retry-wait` | `5` | Base wait in seconds between retries (exponential backoff) |
-| `--timeout` | `30` | Inactivity timeout in minutes (resets on every successful read/write) |
-
-For multi-file transfers, a `.croc-progress` file tracks completed files. If the transfer is interrupted and restarted, already-completed files are automatically skipped.
+| `--retry` | `20` | Number of retry attempts on connection failure (0 = no retry) |
+| `--retry-wait` | `3` | Base wait in seconds between retries (exponential backoff) |
+| `--timeout` | `120` | Inactivity timeout in minutes (resets on every successful read/write) |
 
 #### Encryption Options
 

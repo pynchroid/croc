@@ -138,9 +138,9 @@ func Run() (err error) {
 		&cli.StringFlag{Name: "socks5", Value: "", Usage: "add a socks5 proxy", EnvVars: []string{"SOCKS5_PROXY"}},
 		&cli.StringFlag{Name: "connect", Value: "", Usage: "add a http proxy", EnvVars: []string{"HTTP_PROXY"}},
 		&cli.StringFlag{Name: "throttleUpload", Value: "", Usage: "throttle the upload speed e.g. 500k"},
-		&cli.IntFlag{Name: "retry", Value: 5, Usage: "number of times to retry on connection failure (0 = no retry)"},
-		&cli.IntFlag{Name: "retry-wait", Value: 5, Usage: "base wait in seconds between retries (exponential backoff)"},
-		&cli.IntFlag{Name: "timeout", Value: 30, Usage: "inactivity timeout in minutes (0 = 30 min default)"},
+		&cli.IntFlag{Name: "retry", Value: 20, Usage: "number of times to retry on connection failure (0 = no retry)"},
+		&cli.IntFlag{Name: "retry-wait", Value: 3, Usage: "base wait in seconds between retries (exponential backoff)"},
+		&cli.IntFlag{Name: "timeout", Value: 120, Usage: "inactivity timeout in minutes (resets on activity, 0 = 2h default)"},
 		&cli.StringFlag{Name: "cipher", Value: "xchacha20", Usage: "encryption cipher (xchacha20, aes-gcm)"},
 		&cli.StringFlag{Name: "kdf", Value: "argon2id", Usage: "key derivation function (argon2id, pbkdf2)"},
 	}
