@@ -140,6 +140,12 @@ type Client struct {
 	chunkMap               map[uint64]struct{}
 	limiter                *rate.Limiter
 
+	// key rotation state
+	baseKey          []byte
+	keyRotationCount uint64
+	encryptCounter   uint64
+	encryptMu        sync.Mutex
+
 	// tcp connections
 	conn []*comm.Comm
 
@@ -1018,6 +1024,25 @@ func (c *Client) resetForRetry() {
 	c.stop = newStop(context.Background())
 }
 
+// checkKeyRotation increments the encrypt counter and rotates the key if needed.
+// Must be called for every encrypt or decrypt operation on the data channel.
+func (c *Client) checkKeyRotation() {
+	c.encryptMu.Lock()
+	defer c.encryptMu.Unlock()
+	c.encryptCounter++
+	if c.encryptCounter >= crypt.KeyRotationInterval {
+		c.keyRotationCount++
+		newKey, err := crypt.DeriveRotatedKey(c.baseKey, c.keyRotationCount)
+		if err != nil {
+			log.Errorf("key rotation failed: %v", err)
+			return
+		}
+		c.Key = newKey
+		c.encryptCounter = 0
+		log.Debugf("key rotated (generation %d)", c.keyRotationCount)
+	}
+}
+
 func showReceiveCommandQrCode(command string) {
 	qrCode, err := qrcode.New(command, qrcode.Medium)
 	if err == nil {
@@ -1632,6 +1657,10 @@ func (c *Client) processMessagePake(m message.Message) (err error) {
 	if err != nil {
 		return err
 	}
+	c.baseKey = make([]byte, len(c.Key))
+	copy(c.baseKey, c.Key)
+	c.keyRotationCount = 0
+	c.encryptCounter = 0
 	log.Debugf("generated key = %+x with salt %x", c.Key, salt)
 
 	// connects to the other ports of the server for transfer
@@ -2230,6 +2259,7 @@ func (c *Client) receiveData(i int) {
 			continue
 		}
 
+		c.checkKeyRotation()
 		data, err = crypt.Decrypt(data, c.Key)
 		if err != nil {
 			log.Errorf("receiveData(%d): decrypt error: %v", i, err)
@@ -2360,6 +2390,7 @@ func (c *Client) sendData(i int) {
 				}
 				c.mutex.Unlock()
 				if usableChunk {
+					c.checkKeyRotation()
 					posByte := make([]byte, 8)
 					binary.LittleEndian.PutUint64(posByte, pos)
 					var err error
