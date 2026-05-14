@@ -1353,6 +1353,12 @@ func (c *Client) transfer() (err error) {
 			log.Debugf("got error receiving: %v", err)
 			if !c.Step1ChannelSecured {
 				err = fmt.Errorf("could not secure channel")
+			} else if strings.Contains(err.Error(), "i/o timeout") {
+				err = fmt.Errorf("connection timed out after %v of inactivity: %w", comm.IdleTimeout, err)
+			} else if strings.Contains(err.Error(), "connection reset") || strings.Contains(err.Error(), "broken pipe") {
+				err = fmt.Errorf("connection lost (network interruption): %w", err)
+			} else if strings.Contains(err.Error(), "EOF") {
+				err = fmt.Errorf("peer disconnected unexpectedly: %w", err)
 			}
 			break
 		}
