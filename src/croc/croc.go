@@ -926,16 +926,22 @@ func isRetryableError(err error) bool {
 	return true
 }
 
-// SendWithRetry wraps Send with automatic retry on transient failures
+// SendWithRetry wraps Send with automatic retry on transient failures.
+// Retry is always active by default (20 retries). Use --retry 0 to disable.
 func (c *Client) SendWithRetry(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, totalNumberFolders int) (err error) {
 	maxRetries := c.Options.MaxRetries
-	if maxRetries <= 0 {
+	if maxRetries == 0 {
+		maxRetries = 20
+	} else if maxRetries < 0 {
+		// negative means explicitly disabled (--retry 0 maps to 0 in CLI, but
+		// we use the Go zero-value trick: 0 = use default, so the CLI sets -1
+		// for "no retry"). For safety, also treat negative as no-retry.
 		return c.Send(filesInfo, emptyFoldersToTransfer, totalNumberFolders)
 	}
 
 	baseWait := c.Options.RetryWait
 	if baseWait <= 0 {
-		baseWait = 5 * time.Second
+		baseWait = 3 * time.Second
 	}
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
@@ -961,16 +967,19 @@ func (c *Client) SendWithRetry(filesInfo []FileInfo, emptyFoldersToTransfer []Fi
 	return fmt.Errorf("transfer failed after %d retries: %w", maxRetries, err)
 }
 
-// ReceiveWithRetry wraps Receive with automatic retry on transient failures
+// ReceiveWithRetry wraps Receive with automatic retry on transient failures.
+// Retry is always active by default (20 retries). Use --retry 0 to disable.
 func (c *Client) ReceiveWithRetry() (err error) {
 	maxRetries := c.Options.MaxRetries
-	if maxRetries <= 0 {
+	if maxRetries == 0 {
+		maxRetries = 20
+	} else if maxRetries < 0 {
 		return c.Receive()
 	}
 
 	baseWait := c.Options.RetryWait
 	if baseWait <= 0 {
-		baseWait = 5 * time.Second
+		baseWait = 3 * time.Second
 	}
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {

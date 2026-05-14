@@ -25,7 +25,7 @@ const maxReadMessageSize = 64 * 1024 * 1024
 
 // IdleTimeout controls how long a connection can be idle before timing out.
 // Activity resets the deadline, so active transfers can run indefinitely.
-var IdleTimeout = 30 * time.Minute
+var IdleTimeout = 2 * time.Hour
 
 // Comm is some basic TCP communication
 type Comm struct {
