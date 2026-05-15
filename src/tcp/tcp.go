@@ -311,7 +311,9 @@ func (s *server) clientCommunication(c *comm.Comm) (room string, err error) {
 	if err != nil {
 		return
 	}
-	strongKeyForEncryption, _, err := crypt.New(strongKey, salt)
+	// Use legacy crypto for relay<->client auth so we stay compatible with
+	// the upstream public relay (croc.schollz.com) which uses PBKDF2+AES-GCM.
+	strongKeyForEncryption, _, err := crypt.NewLegacy(strongKey, salt)
 	if err != nil {
 		return
 	}
@@ -321,13 +323,13 @@ func (s *server) clientCommunication(c *comm.Comm) (room string, err error) {
 	if err != nil {
 		return
 	}
-	passwordBytes, err := crypt.Decrypt(passwordBytesEnc, strongKeyForEncryption)
+	passwordBytes, err := crypt.DecryptAES(passwordBytesEnc, strongKeyForEncryption)
 	if err != nil {
 		return
 	}
 	if strings.TrimSpace(string(passwordBytes)) != s.password {
 		err = fmt.Errorf("bad password")
-		enc, _ := crypt.Encrypt([]byte(err.Error()), strongKeyForEncryption)
+		enc, _ := crypt.EncryptAES([]byte(err.Error()), strongKeyForEncryption)
 		if err = c.Send(enc); err != nil {
 			return "", fmt.Errorf("send error: %w", err)
 		}
@@ -340,7 +342,7 @@ func (s *server) clientCommunication(c *comm.Comm) (room string, err error) {
 		banner = "ok"
 	}
 	log.Debugf("sending '%s'", banner)
-	bSend, err := crypt.Encrypt([]byte(banner+"|||"+c.Connection().RemoteAddr().String()), strongKeyForEncryption)
+	bSend, err := crypt.EncryptAES([]byte(banner+"|||"+c.Connection().RemoteAddr().String()), strongKeyForEncryption)
 	if err != nil {
 		return
 	}
@@ -355,7 +357,7 @@ func (s *server) clientCommunication(c *comm.Comm) (room string, err error) {
 	if err != nil {
 		return
 	}
-	roomBytes, err := crypt.Decrypt(enc, strongKeyForEncryption)
+	roomBytes, err := crypt.DecryptAES(enc, strongKeyForEncryption)
 	if err != nil {
 		return
 	}
@@ -371,7 +373,7 @@ func (s *server) clientCommunication(c *comm.Comm) (room string, err error) {
 		s.rooms.Unlock()
 		// tell the client that they got the room
 
-		bSend, err = crypt.Encrypt([]byte("ok"), strongKeyForEncryption)
+		bSend, err = crypt.EncryptAES([]byte("ok"), strongKeyForEncryption)
 		if err != nil {
 			return
 		}
@@ -386,7 +388,7 @@ func (s *server) clientCommunication(c *comm.Comm) (room string, err error) {
 	}
 	if s.rooms.rooms[room].full {
 		s.rooms.Unlock()
-		bSend, err = crypt.Encrypt([]byte("room full"), strongKeyForEncryption)
+		bSend, err = crypt.EncryptAES([]byte("room full"), strongKeyForEncryption)
 		if err != nil {
 			return
 		}
@@ -420,7 +422,7 @@ func (s *server) clientCommunication(c *comm.Comm) (room string, err error) {
 	}(otherConnection, c, &wg)
 
 	// tell the sender everything is ready
-	bSend, err = crypt.Encrypt([]byte("ok"), strongKeyForEncryption)
+	bSend, err = crypt.EncryptAES([]byte("ok"), strongKeyForEncryption)
 	if err != nil {
 		return
 	}
@@ -579,7 +581,9 @@ func ConnectToTCPServer(address, password, room string, timelimit ...time.Durati
 	}
 	log.Debugf("strong key: %x", strongKey)
 
-	strongKeyForEncryption, salt, err := crypt.New(strongKey, nil)
+	// Use legacy crypto for relay<->client auth so we stay compatible with
+	// the upstream public relay (croc.schollz.com) which uses PBKDF2+AES-GCM.
+	strongKeyForEncryption, salt, err := crypt.NewLegacy(strongKey, nil)
 	if err != nil {
 		log.Debug(err)
 		return
@@ -592,7 +596,7 @@ func ConnectToTCPServer(address, password, room string, timelimit ...time.Durati
 	}
 
 	log.Debugf("sending password '%s'", maskedPassword(password))
-	bSend, err := crypt.Encrypt([]byte(password), strongKeyForEncryption)
+	bSend, err := crypt.EncryptAES([]byte(password), strongKeyForEncryption)
 	if err != nil {
 		log.Debug(err)
 		return
@@ -608,7 +612,7 @@ func ConnectToTCPServer(address, password, room string, timelimit ...time.Durati
 		log.Debug(err)
 		return
 	}
-	data, err := crypt.Decrypt(enc, strongKeyForEncryption)
+	data, err := crypt.DecryptAES(enc, strongKeyForEncryption)
 	if err != nil {
 		log.Debug(err)
 		return
@@ -621,7 +625,7 @@ func ConnectToTCPServer(address, password, room string, timelimit ...time.Durati
 	banner = strings.Split(string(data), "|||")[0]
 	ipaddr = strings.Split(string(data), "|||")[1]
 	log.Debugf("sending room; %s", room)
-	bSend, err = crypt.Encrypt([]byte(room), strongKeyForEncryption)
+	bSend, err = crypt.EncryptAES([]byte(room), strongKeyForEncryption)
 	if err != nil {
 		log.Debug(err)
 		return
@@ -637,7 +641,7 @@ func ConnectToTCPServer(address, password, room string, timelimit ...time.Durati
 		log.Debug(err)
 		return
 	}
-	data, err = crypt.Decrypt(enc, strongKeyForEncryption)
+	data, err = crypt.DecryptAES(enc, strongKeyForEncryption)
 	if err != nil {
 		log.Debug(err)
 		return
