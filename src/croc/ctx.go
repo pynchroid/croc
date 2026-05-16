@@ -95,7 +95,7 @@ func (s *stop) Cancel() {
 // SendError tells the peer to interrupt their loops and goroutines
 func (c *Client) SendError() {
 	if c.Key != nil && len(c.conn) > 0 && c.conn[0] != nil {
-		message.Send(c.conn[0], c.Key, message.Message{
+		c.sendMsg(message.Message{
 			Type:    message.TypeError,
 			Message: "refusing files",
 		})

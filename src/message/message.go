@@ -37,9 +37,9 @@ func (m Message) String() string {
 	return string(b)
 }
 
-// Send will send out
-func Send(c *comm.Comm, key []byte, m Message) (err error) {
-	mSend, err := Encode(key, m)
+// Send will send out. cipher selects the encryption algorithm: "aes-gcm" for legacy, anything else for XChaCha20.
+func Send(c *comm.Comm, key []byte, m Message, cipher string) (err error) {
+	mSend, err := Encode(key, m, cipher)
 	if err != nil {
 		return
 	}
@@ -47,8 +47,8 @@ func Send(c *comm.Comm, key []byte, m Message) (err error) {
 	return
 }
 
-// Encode will convert to bytes
-func Encode(key []byte, m Message) (b []byte, err error) {
+// Encode will convert to bytes. cipher selects the encryption algorithm.
+func Encode(key []byte, m Message, cipher string) (b []byte, err error) {
 	b, err = json.Marshal(m)
 	if err != nil {
 		return
@@ -56,17 +56,25 @@ func Encode(key []byte, m Message) (b []byte, err error) {
 	b = compress.Compress(b)
 	if key != nil {
 		log.Debugf("writing %s message (encrypted)", m.Type)
-		b, err = crypt.Encrypt(b, key)
+		if cipher == "aes-gcm" {
+			b, err = crypt.EncryptAES(b, key)
+		} else {
+			b, err = crypt.Encrypt(b, key)
+		}
 	} else {
 		log.Debugf("writing %s message (unencrypted)", m.Type)
 	}
 	return
 }
 
-// Decode will convert from bytes
-func Decode(key []byte, b []byte) (m Message, err error) {
+// Decode will convert from bytes. cipher selects the decryption algorithm.
+func Decode(key []byte, b []byte, cipher string) (m Message, err error) {
 	if key != nil {
-		b, err = crypt.Decrypt(b, key)
+		if cipher == "aes-gcm" {
+			b, err = crypt.DecryptAES(b, key)
+		} else {
+			b, err = crypt.Decrypt(b, key)
+		}
 		if err != nil {
 			return
 		}

@@ -104,8 +104,9 @@ type Options struct {
 }
 
 type SimpleMessage struct {
-	Bytes []byte
-	Kind  string
+	Bytes  []byte
+	Kind   string
+	Crypto string `json:",omitempty"`
 }
 
 // Client holds the state of the croc transfer
@@ -780,6 +781,8 @@ On the other computer run:
 			log.Debugf("banner: %s", banner)
 			log.Debugf("connection established: %+v", conn)
 			var kB []byte
+			var peerCrypto string // negotiated crypto: "xchacha20" or "" (legacy AES-GCM)
+			didNegotiate := false
 			B, _ := pake.InitCurve([]byte(c.Options.SharedSecret[5:]), 1, c.Options.Curve)
 			for {
 				if err := c.ctxErr(); err != nil {
@@ -800,33 +803,31 @@ On the other computer run:
 				if kB != nil {
 					var decryptErr error
 					var dataDecrypt []byte
-					dataDecrypt, decryptErr = crypt.Decrypt(data, kB)
+					if peerCrypto == "xchacha20" {
+						dataDecrypt, decryptErr = crypt.Decrypt(data, kB)
+					} else {
+						dataDecrypt, decryptErr = crypt.DecryptAES(data, kB)
+					}
 					if decryptErr != nil {
 						log.Tracef("error decrypting: %v: '%s'", decryptErr, data)
-						// relay sent a message encrypted with an invalid key.
-						// consider this a security issue and abort
-						if strings.Contains(decryptErr.Error(), "message authentication failed") {
+						if strings.Contains(decryptErr.Error(), "message authentication failed") ||
+							strings.Contains(decryptErr.Error(), "incorrect passphrase") {
 							errchan <- decryptErr
 							return
 						}
 					} else {
-						// copy dataDecrypt to data
 						data = dataDecrypt
 						log.Tracef("decrypted: %s", data)
 					}
 				}
 				if bytes.Equal(data, ipRequest) {
 					log.Tracef("got ipRequest")
-					// recipient wants to try to connect to local ips
 					var ips []string
-					// only get local ips if the local is enabled
 					if !c.Options.DisableLocal {
-						// get list of local ips
 						ips, err = utils.GetLocalIPs()
 						if err != nil {
 							log.Tracef("error getting local ips: %v", err)
 						}
-						// prepend the port that is being listened to
 						ips = append([]string{c.Options.RelayPorts[0]}, ips...)
 					}
 					log.Tracef("sending ips: %+v", ips)
@@ -834,7 +835,11 @@ On the other computer run:
 					if errIps != nil {
 						log.Tracef("error marshalling ips: %v", errIps)
 					}
-					bips, errIps = crypt.Encrypt(bips, kB)
+					if peerCrypto == "xchacha20" {
+						bips, errIps = crypt.Encrypt(bips, kB)
+					} else {
+						bips, errIps = crypt.EncryptAES(bips, kB)
+					}
 					if errIps != nil {
 						log.Tracef("error encrypting ips: %v", errIps)
 					}
@@ -843,6 +848,12 @@ On the other computer run:
 					}
 				} else if dataMessage.Kind == "pake1" {
 					log.Trace("got pake1")
+					didNegotiate = true
+					// negotiate cipher: use XChaCha20 only if peer advertises it
+					if dataMessage.Crypto == "xchacha20" {
+						peerCrypto = "xchacha20"
+					}
+					log.Tracef("negotiated crypto: %q", peerCrypto)
 					var pakeError error
 					pakeError = B.Update(dataMessage.Bytes)
 					if pakeError == nil {
@@ -851,6 +862,7 @@ On the other computer run:
 							log.Tracef("dataMessage kB: %x", kB)
 							dataMessage.Bytes = B.Bytes()
 							dataMessage.Kind = "pake2"
+							dataMessage.Crypto = peerCrypto
 							data, _ = json.Marshal(dataMessage)
 							if pakeError = conn.Send(data); err != nil {
 								log.Errorf("dataMessage error sending: %v", err)
@@ -870,6 +882,13 @@ On the other computer run:
 					errchan <- fmt.Errorf("gracefully refusing using the public relay")
 					return
 				}
+			}
+
+			// fall back to legacy crypto for the data channel if peer negotiated but doesn't support XChaCha20
+			if didNegotiate && peerCrypto != "xchacha20" {
+				c.Options.Cipher = "aes-gcm"
+				c.Options.KDF = "pbkdf2"
+				log.Debug("peer uses legacy crypto, falling back to AES-GCM + PBKDF2 for data channel")
 			}
 
 			c.conn[0] = conn
@@ -1131,6 +1150,16 @@ func (c *Client) deriveKey(passphrase, salt []byte) (key []byte, outSalt []byte,
 	return crypt.New(passphrase, salt)
 }
 
+// sendMsg sends a message using the negotiated cipher.
+func (c *Client) sendMsg(m message.Message) error {
+	return message.Send(c.conn[0], c.Key, m, c.Options.Cipher)
+}
+
+// decodeMsg decodes a message using the negotiated cipher.
+func (c *Client) decodeMsg(payload []byte) (message.Message, error) {
+	return message.Decode(c.Key, payload, c.Options.Cipher)
+}
+
 // encryptBytes encrypts data using the configured cipher.
 func (c *Client) encryptBytes(plaintext, key []byte) ([]byte, error) {
 	if c.Options.Cipher == "aes-gcm" {
@@ -1301,8 +1330,9 @@ func (c *Client) Receive() (err error) {
 				return err
 			}
 			dataMessage := SimpleMessage{
-				Bytes: A.Bytes(),
-				Kind:  "pake1",
+				Bytes:  A.Bytes(),
+				Kind:   "pake1",
+				Crypto: "xchacha20",
 			}
 			data, _ = json.Marshal(dataMessage)
 			if err = c.conn[0].Send(data); err != nil {
@@ -1318,6 +1348,9 @@ func (c *Client) Receive() (err error) {
 				log.Debugf("data: %s", data)
 				return fmt.Errorf("dataMessage %s pake failed", ipRequest)
 			}
+			// read negotiated cipher from sender's pake2 response
+			peerCrypto := dataMessage.Crypto
+			log.Debugf("negotiated crypto: %q", peerCrypto)
 			err = A.Update(dataMessage.Bytes)
 			if err != nil {
 				return
@@ -1329,8 +1362,12 @@ func (c *Client) Receive() (err error) {
 			}
 			log.Debugf("dataMessage kA: %x", kA)
 
-			// secure ipRequest
-			data, err = crypt.Encrypt([]byte(ipRequest), kA)
+			// secure ipRequest using negotiated cipher
+			if peerCrypto == "xchacha20" {
+				data, err = crypt.Encrypt([]byte(ipRequest), kA)
+			} else {
+				data, err = crypt.EncryptAES([]byte(ipRequest), kA)
+			}
 			if err != nil {
 				return
 			}
@@ -1342,13 +1379,23 @@ func (c *Client) Receive() (err error) {
 			if err != nil {
 				return
 			}
-			data, err = crypt.Decrypt(data, kA)
+			if peerCrypto == "xchacha20" {
+				data, err = crypt.Decrypt(data, kA)
+			} else {
+				data, err = crypt.DecryptAES(data, kA)
+			}
 			if err != nil {
 				return
 			}
 			log.Debugf("ips data: %s", data)
 			if err = json.Unmarshal(data, &ips); err != nil {
 				log.Debugf("ips unmarshal error: %v", err)
+			}
+			// fall back to legacy crypto for the data channel if peer doesn't support XChaCha20
+			if peerCrypto != "xchacha20" {
+				c.Options.Cipher = "aes-gcm"
+				c.Options.KDF = "pbkdf2"
+				log.Debug("peer uses legacy crypto, falling back to AES-GCM + PBKDF2 for data channel")
 			}
 			return
 		}()
@@ -1434,7 +1481,7 @@ func (c *Client) transfer() (err error) {
 	// if recipient, initialize with sending pake information
 	log.Debug("ready")
 	if !c.Options.IsSender && !c.Step1ChannelSecured {
-		err = message.Send(c.conn[0], c.Key, message.Message{
+		err = c.sendMsg(message.Message{
 			Type:   message.TypePAKE,
 			Bytes:  c.Pake.Bytes(),
 			Bytes2: []byte(c.Options.Curve),
@@ -1655,7 +1702,7 @@ func (c *Client) processMessageFileInfo(m message.Message) (done bool, err error
 		}
 		choice := strings.ToLower(utils.GetInput(""))
 		if choice != "" && choice != "y" && choice != "yes" {
-			err = message.Send(c.conn[0], c.Key, message.Message{
+			err = c.sendMsg(message.Message{
 				Type:    message.TypeError,
 				Message: "refusing files",
 			})
@@ -1698,7 +1745,7 @@ func (c *Client) processMessageFileInfo(m message.Message) (done bool, err error
 		c.SuccessfulTransfer = true
 		c.Step3RecipientRequestFile = true
 		c.Step4FileTransferred = true
-		errStopTransfer := message.Send(c.conn[0], c.Key, message.Message{
+		errStopTransfer := c.sendMsg(message.Message{
 			Type: message.TypeFinished,
 		})
 		if errStopTransfer != nil {
@@ -1747,7 +1794,7 @@ func (c *Client) processMessagePake(m message.Message) (err error) {
 			return
 		}
 		log.Debug("sender sending pake+salt")
-		err = message.Send(c.conn[0], c.Key, message.Message{
+		err = c.sendMsg(message.Message{
 			Type:   message.TypePAKE,
 			Bytes:  c.Pake.Bytes(),
 			Bytes2: salt,
@@ -1811,7 +1858,7 @@ func (c *Client) processMessagePake(m message.Message) (err error) {
 	wg.Wait()
 	if !c.Options.IsSender {
 		log.Debug("sending external IP")
-		err = message.Send(c.conn[0], c.Key, message.Message{
+		err = c.sendMsg(message.Message{
 			Type:    message.TypeExternalIP,
 			Message: c.ExternalIP,
 			Bytes:   m.Bytes,
@@ -1823,7 +1870,7 @@ func (c *Client) processMessagePake(m message.Message) (err error) {
 func (c *Client) processExternalIP(m message.Message) (done bool, err error) {
 	log.Debugf("received external IP: %+v", m)
 	if c.Options.IsSender {
-		err = message.Send(c.conn[0], c.Key, message.Message{
+		err = c.sendMsg(message.Message{
 			Type:    message.TypeExternalIP,
 			Message: c.ExternalIP,
 		})
@@ -1841,7 +1888,7 @@ func (c *Client) processExternalIP(m message.Message) (done bool, err error) {
 }
 
 func (c *Client) processMessage(payload []byte) (done bool, err error) {
-	m, err := message.Decode(c.Key, payload)
+	m, err := c.decodeMsg(payload)
 	if err != nil {
 		err = fmt.Errorf("problem with decoding: %w", err)
 		log.Debug(err)
@@ -1859,7 +1906,7 @@ func (c *Client) processMessage(payload []byte) (done bool, err error) {
 
 	switch m.Type {
 	case message.TypeFinished:
-		err = message.Send(c.conn[0], c.Key, message.Message{
+		err = c.sendMsg(message.Message{
 			Type: message.TypeFinished,
 		})
 		done = true
@@ -1904,7 +1951,7 @@ func (c *Client) processMessage(payload []byte) (done bool, err error) {
 			fmt.Fprintf(os.Stderr, "Send to machine '%s'? (Y/n) ", remoteFile.MachineID)
 			choice := strings.ToLower(utils.GetInput(""))
 			if choice != "" && choice != "y" && choice != "yes" {
-				err = message.Send(c.conn[0], c.Key, message.Message{
+				err = c.sendMsg(message.Message{
 					Type:    message.TypeError,
 					Message: "refusing files",
 				})
@@ -1918,7 +1965,7 @@ func (c *Client) processMessage(payload []byte) (done bool, err error) {
 		c.Step4FileTransferred = false
 		c.Step3RecipientRequestFile = false
 		log.Debug("sending close-recipient")
-		err = message.Send(c.conn[0], c.Key, message.Message{
+		err = c.sendMsg(message.Message{
 			Type: message.TypeCloseRecipient,
 		})
 	case message.TypeCloseRecipient:
@@ -1955,7 +2002,7 @@ func (c *Client) updateIfSenderChannelSecured() (err error) {
 			log.Error(err)
 			return
 		}
-		err = message.Send(c.conn[0], c.Key, message.Message{
+		err = c.sendMsg(message.Message{
 			Type:  message.TypeFileInfo,
 			Bytes: b,
 		})
@@ -2030,7 +2077,7 @@ func (c *Client) recipientInitializeFile() (err error) {
 func (c *Client) recipientGetFileReady(finished bool) (err error) {
 	if finished {
 		log.Debug("finished")
-		err = message.Send(c.conn[0], c.Key, message.Message{
+		err = c.sendMsg(message.Message{
 			Type: message.TypeFinished,
 		})
 		if err != nil {
@@ -2064,7 +2111,7 @@ func (c *Client) recipientGetFileReady(finished bool) (err error) {
 	}
 
 	log.Debugf("sending recipient ready with %d chunks", len(c.CurrentFileChunks))
-	err = message.Send(c.conn[0], c.Key, message.Message{
+	err = c.sendMsg(message.Message{
 		Type:  message.TypeRecipientReady,
 		Bytes: bRequest,
 	})
@@ -2411,7 +2458,7 @@ func (c *Client) receiveData(i int) {
 				log.Tracef("Successful closing %s", c.CurrentFile.Name())
 			}
 			log.Tracef("sending close-sender")
-			if sendErr := message.Send(c.conn[0], c.Key, message.Message{
+			if sendErr := c.sendMsg(message.Message{
 				Type: message.TypeCloseSender,
 			}); sendErr != nil {
 				log.Tracef("sending close-sender: %v", sendErr)
@@ -2446,7 +2493,7 @@ func (c *Client) receiveData(i int) {
 				fmt.Print(string(b))
 			}
 			log.Debug("sending close-sender")
-			err = message.Send(c.conn[0], c.Key, message.Message{
+			err = c.sendMsg(message.Message{
 				Type: message.TypeCloseSender,
 			})
 			if err != nil {
