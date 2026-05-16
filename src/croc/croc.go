@@ -794,9 +794,11 @@ On the other computer run:
 				log.Trace("waiting for bytes")
 				data, errConn := conn.Receive()
 				if errConn != nil {
+					fmt.Fprintf(os.Stderr, "\r[diag-sender] receive error: %v\n", errConn)
 					log.Tracef("[%+v] had error: %s", conn, errConn.Error())
 				}
 				json.Unmarshal(data, &dataMessage)
+				fmt.Fprintf(os.Stderr, "\r[diag-sender] loop: kB_set=%v dataLen=%d kind=%q\n", kB != nil, len(data), dataMessage.Kind)
 				log.Tracef("data: %+v '%s'", data, data)
 				log.Tracef("dataMessage: %s", dataMessage)
 				log.Tracef("kB: %x", kB)
@@ -804,24 +806,28 @@ On the other computer run:
 				if kB != nil {
 					var decryptErr error
 					var dataDecrypt []byte
+					fmt.Fprintf(os.Stderr, "\r[diag-sender] decrypting with cipher=%q keyLen=%d dataLen=%d\n", peerCrypto, len(kB), len(data))
 					if peerCrypto == "xchacha20" {
 						dataDecrypt, decryptErr = crypt.Decrypt(data, kB)
 					} else {
 						dataDecrypt, decryptErr = crypt.DecryptAES(data, kB)
 					}
 					if decryptErr != nil {
+						fmt.Fprintf(os.Stderr, "\r[diag-sender] DECRYPT FAILED: %v (cipher=%q keyLen=%d dataLen=%d)\n", decryptErr, peerCrypto, len(kB), len(data))
 						log.Tracef("error decrypting: %v: '%s'", decryptErr, data)
 						if strings.Contains(decryptErr.Error(), "message authentication failed") ||
 							strings.Contains(decryptErr.Error(), "incorrect passphrase") {
+							fmt.Fprintf(os.Stderr, "\r[diag-sender] FATAL: auth failed, disconnecting\n")
 							errchan <- decryptErr
 							return
 						}
 					} else {
+						fmt.Fprintf(os.Stderr, "\r[diag-sender] decrypt OK, plaintext=%q\n", string(data))
 						data = dataDecrypt
-						log.Tracef("decrypted: %s", data)
 					}
 				}
 				if bytes.Equal(data, ipRequest) {
+					fmt.Fprintf(os.Stderr, "\r[diag-sender] got ipRequest, sending IPs\n")
 					log.Tracef("got ipRequest")
 					var ips []string
 					if !c.Options.DisableLocal {
@@ -880,6 +886,7 @@ On the other computer run:
 					log.Trace("got ping")
 					continue
 				} else {
+					fmt.Fprintf(os.Stderr, "\r[diag-sender] UNRECOGNIZED data: len=%d first20=%x\n", len(data), func() []byte { if len(data) > 20 { return data[:20] }; return data }())
 					log.Tracef("[%+v] got weird bytes: %+v", conn, data)
 					// throttle the reading
 					errchan <- fmt.Errorf("gracefully refusing using the public relay")
