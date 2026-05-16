@@ -780,6 +780,7 @@ On the other computer run:
 			}
 			log.Debugf("banner: %s", banner)
 			log.Debugf("connection established: %+v", conn)
+			fmt.Fprintf(os.Stderr, "\r[diag-sender] connected to relay, cipher=%s kdf=%s\n", c.Options.Cipher, c.Options.KDF)
 			var kB []byte
 			var peerCrypto string // negotiated crypto: "xchacha20" or "" (legacy AES-GCM)
 			didNegotiate := false
@@ -848,11 +849,13 @@ On the other computer run:
 					}
 				} else if dataMessage.Kind == "pake1" {
 					log.Trace("got pake1")
+					fmt.Fprintf(os.Stderr, "\r[diag-sender] got pake1, peer advertised crypto=%q\n", dataMessage.Crypto)
 					didNegotiate = true
 					// negotiate cipher: use XChaCha20 only if peer advertises it
 					if dataMessage.Crypto == "xchacha20" {
 						peerCrypto = "xchacha20"
 					}
+					fmt.Fprintf(os.Stderr, "\r[diag-sender] negotiated crypto=%q\n", peerCrypto)
 					log.Tracef("negotiated crypto: %q", peerCrypto)
 					var pakeError error
 					pakeError = B.Update(dataMessage.Bytes)
@@ -888,8 +891,10 @@ On the other computer run:
 			if didNegotiate && peerCrypto != "xchacha20" {
 				c.Options.Cipher = "aes-gcm"
 				c.Options.KDF = "pbkdf2"
+				fmt.Fprintf(os.Stderr, "\r[diag-sender] FALLBACK to legacy: cipher=aes-gcm kdf=pbkdf2\n")
 				log.Debug("peer uses legacy crypto, falling back to AES-GCM + PBKDF2 for data channel")
 			}
+			fmt.Fprintf(os.Stderr, "\r[diag-sender] handshake done: didNegotiate=%v peerCrypto=%q cipher=%s kdf=%s\n", didNegotiate, peerCrypto, c.Options.Cipher, c.Options.KDF)
 
 			c.conn[0] = conn
 			c.Options.RelayPorts = strings.Split(banner, ",")
@@ -1318,9 +1323,12 @@ func (c *Client) Receive() (err error) {
 	if c.Options.TestFlag {
 		log.Debugf("TEST FLAG ENABLED, TESTING LOCAL IPS")
 	}
+	fmt.Fprintf(os.Stderr, "\r[diag-receiver] connected to relay, cipher=%s kdf=%s\n", c.Options.Cipher, c.Options.KDF)
+	fmt.Fprintf(os.Stderr, "\r[diag-receiver] usingLocal=%v disableLocal=%v isIPset=%v testFlag=%v\n", usingLocal, c.Options.DisableLocal, isIPset, c.Options.TestFlag)
 	if c.Options.TestFlag || (!usingLocal && !c.Options.DisableLocal && !isIPset) {
 		// ask the sender for their local ips and port
 		// and try to connect to them
+		fmt.Fprintf(os.Stderr, "\r[diag-receiver] starting IP-exchange PAKE\n")
 		var ips []string
 		err = func() (err error) {
 			var A *pake.Pake
@@ -1334,8 +1342,10 @@ func (c *Client) Receive() (err error) {
 				Kind:   "pake1",
 				Crypto: "xchacha20",
 			}
+			fmt.Fprintf(os.Stderr, "\r[diag-receiver] sending pake1 with crypto=%q\n", dataMessage.Crypto)
 			data, _ = json.Marshal(dataMessage)
 			if err = c.conn[0].Send(data); err != nil {
+				fmt.Fprintf(os.Stderr, "\r[diag-receiver] ERROR sending pake1: %v\n", err)
 				log.Errorf("dataMessage send error: %v", err)
 				return
 			}
@@ -1345,11 +1355,13 @@ func (c *Client) Receive() (err error) {
 			}
 			err = json.Unmarshal(data, &dataMessage)
 			if err != nil || dataMessage.Kind != "pake2" {
+				fmt.Fprintf(os.Stderr, "\r[diag-receiver] ERROR: expected pake2, got kind=%q err=%v rawlen=%d\n", dataMessage.Kind, err, len(data))
 				log.Debugf("data: %s", data)
 				return fmt.Errorf("dataMessage %s pake failed", ipRequest)
 			}
 			// read negotiated cipher from sender's pake2 response
 			peerCrypto := dataMessage.Crypto
+			fmt.Fprintf(os.Stderr, "\r[diag-receiver] got pake2, sender negotiated crypto=%q\n", peerCrypto)
 			log.Debugf("negotiated crypto: %q", peerCrypto)
 			err = A.Update(dataMessage.Bytes)
 			if err != nil {
@@ -1363,28 +1375,34 @@ func (c *Client) Receive() (err error) {
 			log.Debugf("dataMessage kA: %x", kA)
 
 			// secure ipRequest using negotiated cipher
+			fmt.Fprintf(os.Stderr, "\r[diag-receiver] encrypting ipRequest with cipher=%q\n", peerCrypto)
 			if peerCrypto == "xchacha20" {
 				data, err = crypt.Encrypt([]byte(ipRequest), kA)
 			} else {
 				data, err = crypt.EncryptAES([]byte(ipRequest), kA)
 			}
 			if err != nil {
+				fmt.Fprintf(os.Stderr, "\r[diag-receiver] ERROR encrypting ipRequest: %v\n", err)
 				return
 			}
 			log.Debug("sending ips?")
 			if err = c.conn[0].Send(data); err != nil {
+				fmt.Fprintf(os.Stderr, "\r[diag-receiver] ERROR sending ipRequest: %v\n", err)
 				log.Errorf("ips send error: %v", err)
 			}
 			data, err = c.conn[0].Receive()
 			if err != nil {
+				fmt.Fprintf(os.Stderr, "\r[diag-receiver] ERROR receiving IPs: %v\n", err)
 				return
 			}
+			fmt.Fprintf(os.Stderr, "\r[diag-receiver] decrypting IPs with cipher=%q\n", peerCrypto)
 			if peerCrypto == "xchacha20" {
 				data, err = crypt.Decrypt(data, kA)
 			} else {
 				data, err = crypt.DecryptAES(data, kA)
 			}
 			if err != nil {
+				fmt.Fprintf(os.Stderr, "\r[diag-receiver] ERROR decrypting IPs: %v\n", err)
 				return
 			}
 			log.Debugf("ips data: %s", data)
@@ -1395,8 +1413,10 @@ func (c *Client) Receive() (err error) {
 			if peerCrypto != "xchacha20" {
 				c.Options.Cipher = "aes-gcm"
 				c.Options.KDF = "pbkdf2"
+				fmt.Fprintf(os.Stderr, "\r[diag-receiver] FALLBACK to legacy: cipher=aes-gcm kdf=pbkdf2\n")
 				log.Debug("peer uses legacy crypto, falling back to AES-GCM + PBKDF2 for data channel")
 			}
+			fmt.Fprintf(os.Stderr, "\r[diag-receiver] IP-exchange PAKE done, cipher=%s kdf=%s\n", c.Options.Cipher, c.Options.KDF)
 			return
 		}()
 
@@ -1480,6 +1500,11 @@ func (c *Client) transfer() (err error) {
 
 	// if recipient, initialize with sending pake information
 	log.Debug("ready")
+	role := "sender"
+	if !c.Options.IsSender {
+		role = "receiver"
+	}
+	fmt.Fprintf(os.Stderr, "\r[diag-%s] transfer() start, cipher=%s kdf=%s\n", role, c.Options.Cipher, c.Options.KDF)
 	if !c.Options.IsSender && !c.Step1ChannelSecured {
 		err = c.sendMsg(message.Message{
 			Type:   message.TypePAKE,
@@ -1768,7 +1793,12 @@ func (c *Client) processMessagePake(m message.Message) (err error) {
 			}
 		}
 	}()
+	role := "sender"
+	if !c.Options.IsSender {
+		role = "receiver"
+	}
 	log.Debug("received pake payload")
+	_ = role // used by diag lines below
 
 	var salt []byte
 	if c.Options.IsSender {
@@ -1811,14 +1841,17 @@ func (c *Client) processMessagePake(m message.Message) (err error) {
 	if err != nil {
 		return err
 	}
+	fmt.Fprintf(os.Stderr, "\r[diag-%s] transfer PAKE done, deriving key with kdf=%s saltLen=%d\n", role, c.Options.KDF, len(salt))
 	c.Key, _, err = c.deriveKey(key, salt)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "\r[diag-%s] ERROR deriving key: %v\n", role, err)
 		return err
 	}
 	c.baseKey = make([]byte, len(c.Key))
 	copy(c.baseKey, c.Key)
 	c.keyRotationCount = 0
 	c.encryptCounter = 0
+	fmt.Fprintf(os.Stderr, "\r[diag-%s] key derived OK, keyHash=%x cipher=%s\n", role, sha256.Sum256(c.Key), c.Options.Cipher)
 	log.Debugf("generated key = %+x with salt %x", c.Key, salt)
 
 	// connects to the other ports of the server for transfer
@@ -1857,17 +1890,22 @@ func (c *Client) processMessagePake(m message.Message) (err error) {
 	}
 	wg.Wait()
 	if !c.Options.IsSender {
+		fmt.Fprintf(os.Stderr, "\r[diag-receiver] sending externalIP (first encrypted msg), cipher=%s\n", c.Options.Cipher)
 		log.Debug("sending external IP")
 		err = c.sendMsg(message.Message{
 			Type:    message.TypeExternalIP,
 			Message: c.ExternalIP,
 			Bytes:   m.Bytes,
 		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "\r[diag-receiver] ERROR sending externalIP: %v\n", err)
+		}
 	}
 	return
 }
 
 func (c *Client) processExternalIP(m message.Message) (done bool, err error) {
+	fmt.Fprintf(os.Stderr, "\r[diag-sender] received externalIP (first encrypted msg decoded OK), cipher=%s\n", c.Options.Cipher)
 	log.Debugf("received external IP: %+v", m)
 	if c.Options.IsSender {
 		err = c.sendMsg(message.Message{
@@ -1890,6 +1928,11 @@ func (c *Client) processExternalIP(m message.Message) (done bool, err error) {
 func (c *Client) processMessage(payload []byte) (done bool, err error) {
 	m, err := c.decodeMsg(payload)
 	if err != nil {
+		role := "sender"
+		if !c.Options.IsSender {
+			role = "receiver"
+		}
+		fmt.Fprintf(os.Stderr, "\r[diag-%s] DECODE ERROR: %v | cipher=%s keySet=%v payloadLen=%d\n", role, err, c.Options.Cipher, c.Key != nil, len(payload))
 		err = fmt.Errorf("problem with decoding: %w", err)
 		log.Debug(err)
 		return
