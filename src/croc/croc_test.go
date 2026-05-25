@@ -160,6 +160,99 @@ func TestCrocEmptyFolder(t *testing.T) {
 	wg.Wait()
 }
 
+func TestCrocMultiFile(t *testing.T) {
+	// Create a temp directory with multiple files to transfer
+	tmpDir, err := os.MkdirTemp("", "croc-multifile-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create 5 files of varying sizes
+	for i := 0; i < 5; i++ {
+		fname := filepath.Join(tmpDir, fmt.Sprintf("file_%d.bin", i))
+		data := make([]byte, 1024*(i+1)) // 1KB, 2KB, 3KB, 4KB, 5KB
+		rand.Read(data)
+		if err := os.WriteFile(fname, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Clean up received files
+	dirName := filepath.Base(tmpDir)
+	defer os.RemoveAll(dirName)
+
+	sender, err := New(Options{
+		IsSender:      true,
+		SharedSecret:  "8123-testmultifile",
+		Debug:         true,
+		RelayAddress:  "127.0.0.1:8281",
+		RelayPorts:    []string{"8281"},
+		RelayPassword: "pass123",
+		Stdout:        false,
+		NoPrompt:      true,
+		DisableLocal:  true,
+		Curve:         "siec",
+		Overwrite:     true,
+		GitIgnore:     false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	receiver, err := New(Options{
+		IsSender:      false,
+		SharedSecret:  "8123-testmultifile",
+		Debug:         true,
+		RelayAddress:  "127.0.0.1:8281",
+		RelayPassword: "pass123",
+		Stdout:        false,
+		NoPrompt:      true,
+		DisableLocal:  true,
+		Curve:         "siec",
+		Overwrite:     true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		filesInfo, emptyFolders, totalNumberFolders, errGet := GetFilesInfo([]string{tmpDir}, false, false, []string{})
+		if errGet != nil {
+			t.Errorf("failed to get file info: %v", errGet)
+		}
+		if err := sender.Send(filesInfo, emptyFolders, totalNumberFolders); err != nil {
+			t.Errorf("send failed: %v", err)
+		}
+		wg.Done()
+	}()
+	time.Sleep(100 * time.Millisecond)
+	go func() {
+		if err := receiver.Receive(); err != nil {
+			t.Errorf("receive failed: %v", err)
+		}
+		wg.Done()
+	}()
+
+	wg.Wait()
+
+	// Verify all 5 files were transferred
+	for i := 0; i < 5; i++ {
+		fname := filepath.Join(dirName, fmt.Sprintf("file_%d.bin", i))
+		info, err := os.Stat(fname)
+		if err != nil {
+			t.Errorf("file %s not found after transfer: %v", fname, err)
+			continue
+		}
+		expectedSize := int64(1024 * (i + 1))
+		if info.Size() != expectedSize {
+			t.Errorf("file %s: expected size %d, got %d", fname, expectedSize, info.Size())
+		}
+	}
+}
+
 func TestCrocSymlink(t *testing.T) {
 	pathName := "../link-in-folder"
 	defer os.RemoveAll(pathName)
