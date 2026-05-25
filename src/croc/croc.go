@@ -800,7 +800,9 @@ On the other computer run:
 					return
 				}
 				json.Unmarshal(data, &dataMessage)
-				fmt.Fprintf(os.Stderr, "\r[diag-sender] loop: kB_set=%v dataLen=%d kind=%q\n", kB != nil, len(data), dataMessage.Kind)
+				if len(data) != 1 {
+					fmt.Fprintf(os.Stderr, "\r[diag-sender] loop: kB_set=%v dataLen=%d kind=%q\n", kB != nil, len(data), dataMessage.Kind)
+				}
 				log.Tracef("data: %+v '%s'", data, data)
 				log.Tracef("dataMessage: %s", dataMessage)
 				log.Tracef("kB: %x", kB)
@@ -2152,6 +2154,7 @@ func (c *Client) recipientGetFileReady(finished bool) (err error) {
 	}
 
 	c.TotalSent = 0
+	c.TotalChunksTransferred = 0
 	c.CurrentFileIsClosed = false
 	machID, _ := machineid.ID()
 	bRequest, _ := json.Marshal(RemoteFileRequest{
