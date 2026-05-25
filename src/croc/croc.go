@@ -796,6 +796,8 @@ On the other computer run:
 				if errConn != nil {
 					fmt.Fprintf(os.Stderr, "\r[diag-sender] receive error: %v\n", errConn)
 					log.Tracef("[%+v] had error: %s", conn, errConn.Error())
+					errchan <- errConn
+					return
 				}
 				json.Unmarshal(data, &dataMessage)
 				fmt.Fprintf(os.Stderr, "\r[diag-sender] loop: kB_set=%v dataLen=%d kind=%q\n", kB != nil, len(data), dataMessage.Kind)
@@ -822,7 +824,7 @@ On the other computer run:
 							return
 						}
 					} else {
-						fmt.Fprintf(os.Stderr, "\r[diag-sender] decrypt OK, plaintext=%q\n", string(data))
+						fmt.Fprintf(os.Stderr, "\r[diag-sender] decrypt OK, plaintext=%q\n", string(dataDecrypt))
 						data = dataDecrypt
 					}
 				}
@@ -873,8 +875,8 @@ On the other computer run:
 							dataMessage.Kind = "pake2"
 							dataMessage.Crypto = peerCrypto
 							data, _ = json.Marshal(dataMessage)
-							if pakeError = conn.Send(data); err != nil {
-								log.Errorf("dataMessage error sending: %v", err)
+							if pakeError = conn.Send(data); pakeError != nil {
+								log.Errorf("dataMessage error sending: %v", pakeError)
 							}
 						}
 
@@ -1826,7 +1828,7 @@ func (c *Client) processMessagePake(m message.Message) (err error) {
 		// generate salt and send it back to recipient
 		log.Debug("generating salt")
 		salt = make([]byte, 8)
-		if _, rerr := rand.Read(salt); err != nil {
+		if _, rerr := rand.Read(salt); rerr != nil {
 			log.Errorf("can't generate random numbers: %v", rerr)
 			return
 		}
