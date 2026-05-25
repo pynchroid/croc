@@ -1362,13 +1362,18 @@ func (c *Client) Receive() (err error) {
 			if err != nil {
 				return
 			}
-			err = json.Unmarshal(data, &dataMessage)
-			if err != nil || dataMessage.Kind != "pake2" {
-				fmt.Fprintf(os.Stderr, "\r[diag-receiver] ERROR: expected pake2, got kind=%q err=%v rawlen=%d\n", dataMessage.Kind, err, len(data))
+			// unmarshal into a fresh message so we don't inherit pake1's
+			// Crypto value when the sender omits the field (upstream croc)
+			var pake2Message SimpleMessage
+			err = json.Unmarshal(data, &pake2Message)
+			if err != nil || pake2Message.Kind != "pake2" {
+				fmt.Fprintf(os.Stderr, "\r[diag-receiver] ERROR: expected pake2, got kind=%q err=%v rawlen=%d\n", pake2Message.Kind, err, len(data))
 				log.Debugf("data: %s", data)
 				return fmt.Errorf("dataMessage %s pake failed", ipRequest)
 			}
-			// read negotiated cipher from sender's pake2 response
+			dataMessage = pake2Message
+			// read negotiated cipher from sender's pake2 response;
+			// empty means the sender is upstream croc (AES-GCM only)
 			peerCrypto := dataMessage.Crypto
 			fmt.Fprintf(os.Stderr, "\r[diag-receiver] got pake2, sender negotiated crypto=%q\n", peerCrypto)
 			log.Debugf("negotiated crypto: %q", peerCrypto)
